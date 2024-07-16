@@ -1,0 +1,23 @@
+
+
+- [ ] image upload
+- [ ] caption 
+- [ ] read image meta data to get information about the image - date, location, timw
+- [ ] ability to add caption
+- [ ] ability to edit the things from the image metadata
+- [ ] better ui
+
+
+
+
+
+
+
+main.go - contains all the routes
+site.go - contains all the site functions
+image.go - contains all the image handling functions
+auth.go - should contain all the auth once done
+sqlite.go - should contain all the db handlers
+
+
+
