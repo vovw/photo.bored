@@ -1,0 +1,25 @@
+# Binary
+app
+
+# Data directories
+data/
+uploads/
+
+# Environment
+.env
+
+# Go
+go.sum
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log

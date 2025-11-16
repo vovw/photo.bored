@@ -1,0 +1,34 @@
+[Unit]
+Description=Photo.Bored - Image Blogging Platform
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+WorkingDirectory=/opt/photo-bored
+ExecStart=/opt/photo-bored/app
+
+# Environment variables
+Environment="PORT=8080"
+Environment="DB_PATH=/opt/photo-bored/data/photos.db"
+Environment="UPLOAD_DIR=/opt/photo-bored/uploads"
+Environment="MAX_UPLOAD_SIZE=52428800"
+Environment="IMAGE_WORKERS=4"
+Environment="DEBUG=false"
+
+# Restart policy
+Restart=on-failure
+RestartSec=5s
+
+# Security settings
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/photo-bored/data /opt/photo-bored/uploads
+
+# Resource limits
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

@@ -1,7 +1,13 @@
 package main
 
 import (
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"image"
+	_ "image/jpeg"
+	_ "image/png"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -11,20 +17,15 @@ import (
 	"time"
 )
 
-type PhotoList struct {
-	Name   string
-	Photos []Photo
-}
-
 type Photo struct {
-	Filename string
-	Date     time.Time
-	Location string
+	Filename string    `json:"filename"`
+	Date     time.Time `json:"date"`
+	Location string    `json:"location"`
 }
-
-var userLists = make(map[string]map[string]*PhotoList)
 
 func handleRoot(w http.ResponseWriter, r *http.Request) {
+	// Add cache headers for static HTML
+	w.Header().Set("Cache-Control", "public, max-age=3600")
 	http.ServeFile(w, r, "index.html")
 }
 
@@ -34,9 +35,10 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err := r.ParseMultipartForm(10 << 20) // 10 MB max
+	// Parse multipart form with max size
+	err := r.ParseMultipartForm(config.MaxUploadSize)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		http.Error(w, "File too large", http.StatusBadRequest)
 		return
 	}
 
@@ -55,99 +57,192 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Validate file type
+	contentType := header.Header.Get("Content-Type")
+	if !strings.HasPrefix(contentType, "image/") {
+		http.Error(w, "File must be an image", http.StatusBadRequest)
+		return
+	}
+
 	err = saveImage(username, listName, file, header)
+	if err != nil {
+		logError("Error saving image: %v", err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"status":  "success",
+		"message": "Image uploaded successfully",
+	})
+}
+
+func handleUserLists(w http.ResponseWriter, r *http.Request) {
+	username := r.URL.Query().Get("username")
+	if username == "" {
+		http.Error(w, "Username required", http.StatusBadRequest)
+		return
+	}
+
+	lists, err := getUserLists(username)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	fmt.Fprintf(w, "Image uploaded successfully")
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"username": username,
+		"lists":    lists,
+	})
 }
 
 func handleViewList(w http.ResponseWriter, r *http.Request) {
-	parts := strings.Split(r.URL.Path, "/")
-	if len(parts) != 4 {
-		http.Error(w, "Invalid URL", http.StatusBadRequest)
+	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/api/view/"), "/")
+	if len(parts) != 2 {
+		http.Error(w, "Invalid URL format. Use /api/view/{username}/{listname}", http.StatusBadRequest)
 		return
 	}
 
-	username := parts[2]
-	listName := parts[3]
+	username := parts[0]
+	listName := parts[1]
 
-	list, ok := userLists[username][listName]
-	if !ok {
+	photos, err := getListPhotos(username, listName)
+	if err != nil {
 		http.Error(w, "List not found", http.StatusNotFound)
 		return
 	}
 
-	fmt.Fprintf(w, "Photos in %s's %s list:\n", username, listName)
-	for _, photo := range list.Photos {
-		fmt.Fprintf(w, "- %s (Date: %s, Location: %s)\n", photo.Filename, photo.Date, photo.Location)
-	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"username": username,
+		"listName": listName,
+		"photos":   photos,
+	})
 }
 
 func handleServeImage(w http.ResponseWriter, r *http.Request) {
-	parts := strings.Split(r.URL.Path, "/")
-	if len(parts) != 5 {
+	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/image/"), "/")
+	if len(parts) < 3 {
 		http.Error(w, "Invalid URL", http.StatusBadRequest)
 		return
 	}
 
-	username := parts[2]
-	listName := parts[3]
-	filename := parts[4]
+	username := parts[0]
+	listName := parts[1]
+	filename := strings.Join(parts[2:], "/")
 
-	path := filepath.Join("uploads", username, listName, filename)
-	http.ServeFile(w, r, path)
+	// Get size parameter for responsive images
+	size := r.URL.Query().Get("size")
+	if size == "" {
+		size = "large"
+	}
+
+	basePath := filepath.Join(config.UploadDir, username, listName, filename)
+	imagePath := getImageVariant(basePath, size)
+
+	// Check if file exists
+	if _, err := os.Stat(imagePath); os.IsNotExist(err) {
+		http.NotFound(w, r)
+		return
+	}
+
+	// Set cache headers for images (1 year)
+	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+
+	// Set content type based on file extension
+	ext := strings.ToLower(filepath.Ext(imagePath))
+	switch ext {
+	case ".webp":
+		w.Header().Set("Content-Type", "image/webp")
+	case ".jpg", ".jpeg":
+		w.Header().Set("Content-Type", "image/jpeg")
+	case ".png":
+		w.Header().Set("Content-Type", "image/png")
+	}
+
+	http.ServeFile(w, r, imagePath)
 }
 
 func saveImage(username, listName string, file multipart.File, header *multipart.FileHeader) error {
-	dir := filepath.Join("uploads", username, listName)
+	// Get or create user
+	userID, err := getOrCreateUser(username)
+	if err != nil {
+		return fmt.Errorf("failed to get/create user: %w", err)
+	}
+
+	// Get or create list
+	listID, err := getOrCreateList(userID, listName)
+	if err != nil {
+		return fmt.Errorf("failed to get/create list: %w", err)
+	}
+
+	// Create directory
+	dir := filepath.Join(config.UploadDir, username, listName)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}
 
-	filename := filepath.Join(dir, header.Filename)
-	dst, err := os.Create(filename)
+	// Generate unique filename
+	randBytes := make([]byte, 8)
+	rand.Read(randBytes)
+	uniqueID := hex.EncodeToString(randBytes)
+	ext := filepath.Ext(header.Filename)
+	filename := fmt.Sprintf("%d_%s%s", time.Now().Unix(), uniqueID, ext)
+	fullPath := filepath.Join(dir, filename)
+
+	// Save original file
+	dst, err := os.Create(fullPath)
 	if err != nil {
 		return err
 	}
 	defer dst.Close()
 
-	if _, err = file.Seek(0, 0); err != nil {
-		return err
-	}
-
-	date, location, err := extractMetadata(file)
+	// Read file into buffer for multiple operations
+	fileBytes, err := io.ReadAll(file)
 	if err != nil {
 		return err
 	}
 
-	if _, err = file.Seek(0, 0); err != nil {
+	// Extract EXIF metadata
+	file.Seek(0, 0)
+	date, location, _ := extractEXIFMetadata(file)
+
+	// Write file
+	_, err = dst.Write(fileBytes)
+	if err != nil {
 		return err
 	}
 
-	if _, err = io.Copy(dst, file); err != nil {
-		return err
+	// Get image dimensions
+	file.Seek(0, 0)
+	cfg, _, err := image.DecodeConfig(file)
+	width, height := 0, 0
+	if err == nil {
+		width = cfg.Width
+		height = cfg.Height
 	}
 
+	// Save to database
 	photo := Photo{
-		Filename: header.Filename,
+		Filename: filename,
 		Date:     date,
 		Location: location,
 	}
 
-	addPhotoToList(username, listName, photo)
-	return nil
-}
+	if err := savePhotoToDB(listID, photo, width, height, len(fileBytes)); err != nil {
+		return err
+	}
 
-func addPhotoToList(username, listName string, photo Photo) {
-	if _, ok := userLists[username]; !ok {
-		userLists[username] = make(map[string]*PhotoList)
+	// Queue image processing job
+	imageJobQueue <- ImageJob{
+		FilePath: fullPath,
+		Username: username,
+		ListName: listName,
+		OrigName: header.Filename,
 	}
-	if _, ok := userLists[username][listName]; !ok {
-		userLists[username][listName] = &PhotoList{Name: listName}
-	}
-	userLists[username][listName].Photos = append(userLists[username][listName].Photos, photo)
+
+	return nil
 }
 
